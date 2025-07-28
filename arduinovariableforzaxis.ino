@@ -41,14 +41,14 @@ int homingSteps2 = 0;
 bool thirdMotorActive = false;
 float currentForceValue = 0.0;
 int currentSpeed = 0;
-const float MIN_FORCE = 1.0;   // Minimum force threshold
-const float MAX_FORCE = 10.0;  // Maximum force for speed mapping
+const float MIN_FORCE = 10.0;   // Minimum force threshold
+const float MAX_FORCE = 100.0;  // Maximum force for speed mapping
 const int MIN_SPEED = 50;      // Minimum speed
 const int MAX_SPEED = 600;     // Maximum speed
 
 // Speed settings
 const int NORMAL_MAX_SPEED = 2400;
-const int NORMAL_ACCELERATION = 4800;
+const int NORMAL_ACCELERATION = 3000;
 const int HOMING_MAX_SPEED = 500;
 const int HOMING_ACCELERATION = 1000;
 
@@ -78,6 +78,7 @@ void setup() {
   
   // Configure stepper parameters (start with normal speeds)
   setNormalSpeed();
+  
   
   // Initialize third motor
   stepper3.setMaxSpeed(MAX_SPEED);
@@ -198,8 +199,9 @@ void stopThirdMotor() {
   if (thirdMotorActive) {
     thirdMotorActive = false;
     stepper3.stop();
-    digitalWrite(BRAKE_PIN, HIGH);  // Engage brake
-    digitalWrite(ENABLE3_PIN, HIGH); // Disable motor
+      // Engage brake
+    digitalWrite(ENABLE3_PIN, HIGH);
+    digitalWrite(BRAKE_PIN, HIGH); // Disable motor
     Serial.println("Third motor stopped - brake engaged");
   }
 }
