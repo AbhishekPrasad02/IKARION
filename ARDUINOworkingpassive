@@ -1,0 +1,602 @@
+#include <AccelStepper.h>
+
+// Stepper motor 1 pins (Joint 1)
+#define STEP1_PIN 44
+#define DIR1_PIN 42
+#define ENABLE1_PIN 46
+
+// Stepper motor 2 pins (Joint 2)
+#define STEP2_PIN 38
+#define DIR2_PIN 36
+#define ENABLE2_PIN 40
+
+// Stepper motor 3 pins (Third motor with force control)
+#define STEP3_PIN 32
+#define DIR3_PIN A14
+#define ENABLE3_PIN 34
+#define BRAKE_PIN A12
+
+// Create AccelStepper objects
+AccelStepper stepper1(AccelStepper::DRIVER, STEP1_PIN, DIR1_PIN);
+AccelStepper stepper2(AccelStepper::DRIVER, STEP2_PIN, DIR2_PIN);
+AccelStepper stepper3(AccelStepper::DRIVER, STEP3_PIN, DIR3_PIN);
+bool receivingPairedData; 
+// Data arrays
+int stepsData1[1000];    // Motor 1 steps
+int stepsData2[1000];    // Motor 2 steps
+int dataCount = 0;
+
+// Motion control variables
+bool motionActive = false;
+int currentPointIndex = 0;
+unsigned long lastMoveTime = 0;
+const unsigned long MOVE_INTERVAL = 100; // 100ms between points
+
+int dataCount1 = 0;
+int dataCount2 = 0;
+// Homing variables
+bool homingActive = false;
+int homingSteps1 = 0;
+int homingSteps2 = 0;
+int homingSteps3 = 0;
+int dataCount3=0;
+// Third motor force control variables
+bool thirdMotorActive = false;
+float currentForceValue = 0.0;
+int currentSpeed = 0;
+const float MIN_FORCE = 10.0;   // Minimum force threshold
+const float MAX_FORCE = 100.0;  // Maximum force for speed mapping
+const int MIN_SPEED = 50;      // Minimum speed
+const int MAX_SPEED = 600;     // Maximum speed
+bool receivingTripletData=false;
+int stepsData3[1000];           // Array to store third motor steps
+int stepsData3Index = 0;        // Current index for stepsData3
+unsigned long lastStepRecord = 0;
+const unsigned long STEP_RECORD_INTERVAL = 100; // Record steps every 100ms
+long thirdMotorAbsoluteSteps = 0;  // Track absolute steps
+
+// Speed settings
+const int NORMAL_MAX_SPEED = 2400;
+const int NORMAL_ACCELERATION = 3000;
+const int HOMING_MAX_SPEED = 200;
+const int HOMING_ACCELERATION = 500;
+
+// Communication variables
+String inputBuffer = "";
+bool receivingArray1 = false;
+bool receivingArray2 = false;
+bool dataReady = false;
+
+void setup() {
+  Serial.begin(9600);
+  Serial2.begin(115200);
+  
+  // Initialize enable pins
+  pinMode(ENABLE1_PIN, OUTPUT);
+  pinMode(ENABLE2_PIN, OUTPUT);
+  pinMode(ENABLE3_PIN, OUTPUT);
+  pinMode(BRAKE_PIN, OUTPUT);
+  
+  // Enable steppers (LOW = enabled for most drivers)
+  digitalWrite(ENABLE1_PIN, HIGH);
+  digitalWrite(ENABLE2_PIN, HIGH);
+  digitalWrite(ENABLE3_PIN, HIGH);
+  
+  // Set brake engaged (HIGH = brake engaged for safety)
+  digitalWrite(BRAKE_PIN, HIGH);
+  
+  // Configure stepper parameters (start with normal speeds)
+  setNormalSpeed();
+  
+  
+  // Initialize third motor
+  stepper3.setMaxSpeed(MAX_SPEED);
+  stepper3.setAcceleration(1000);
+  
+  Serial.println("Arduino Mega with Third Motor - Waiting for ESP32 data...");
+}
+
+void loop() {
+  // Read data from ESP32
+  while (Serial2.available()) {
+    char c = Serial2.read();
+    delayMicroseconds(10);
+    if (c == '\n') {
+      processLine(inputBuffer);
+      inputBuffer = "";
+    } else if (c != '\r') {
+      inputBuffer += c;
+    }
+  }
+  
+  // Handle any manual serial commands (non-blocking)
+ 
+  // Handle motion execution
+  updateMotion();
+  updateHoming();
+  updateThirdMotor();
+}
+
+void processLine(String line) {
+  line.trim();
+  
+  // Check for force control commands
+  if (line == "FORCE_START") {
+    startThirdMotor();
+    return;
+  }
+  
+  if (line == "FORCE_STOP") {
+    stopThirdMotor();
+    return;
+  }
+  
+  if (line.startsWith("FORCE_VALUE ")) {
+    float forceValue = line.substring(12).toFloat();
+    updateThirdMotorSpeed(forceValue);
+    return;
+  }
+  
+  // Check for homing command
+  if (line.startsWith("HOMING ")) {
+    parseHomingCommand(line);
+    return;
+  }
+  
+  if (line == "START_TRIPLET_DATA") {
+    receivingTripletData = true;
+    dataCount1 = 0;
+    dataCount2 = 0;
+    dataCount1 = 0;
+    Serial.println("Started receiving triplet data");
+    Serial2.println("READY"); // Tell ESP32 we're ready
+    return;
+  }
+  
+  if (line == "DATA_COMPLETE") {
+    receivingTripletData = false;
+    Serial.println("Data reception complete!");
+    Serial.print("Array 1 total values: ");
+    Serial.println(dataCount1);
+    Serial.print("Array 2 total values: ");
+    Serial.println(dataCount2);
+    Serial.print("Array 3 total values: ");
+    Serial.println(dataCount1);
+    dataReady = true; // Set data ready flag
+    return;
+  }
+  
+  // Process triplet data chunks
+  if (receivingTripletData) {
+    parseTripletChunk(line);
+    Serial2.println("READY"); // Ready for next chunk
+  }
+  
+  if (line == "PRINT_DATA") {
+    if (dataReady) {
+      setNormalSpeed(); // Ensure normal speed settings before motion
+      startMotion();
+    } else {
+      Serial.println("No data available to execute");
+    }
+    return;
+  }
+  
+  if(line == "rec") {
+    digitalWrite(ENABLE1_PIN, HIGH);
+    digitalWrite(ENABLE2_PIN, HIGH);
+    stepsData3Index = 1;
+    stepper3.setCurrentPosition(0);
+    lastStepRecord = millis();
+    thirdMotorAbsoluteSteps = stepper3.currentPosition();
+  }
+  
+  if(line == "stop") {
+    digitalWrite(ENABLE1_PIN, LOW);
+    digitalWrite(ENABLE2_PIN, LOW);
+    
+    stopThirdMotor(); // Also stop third motor when recording stops
+    stepsData3[0]=stepsData3Index-1;
+    sendThirdMotorSteps();
+  }
+}
+
+void parseTripletChunk(String data) {
+  int start = 0;
+  int comma = 0;
+  int arrayIndex = 0; // 0 for array1, 1 for array2, 2 for array3
+  
+  Serial.print("Parsing chunk: ");
+  Serial.println(data);
+  
+  while (start < data.length() && (dataCount1 < 1000 && dataCount2 < 1000 && dataCount1 < 1000)) {
+    comma = data.indexOf(',', start);
+    
+    String value;
+    if (comma != -1) {
+      value = data.substring(start, comma);
+    } else {
+      value = data.substring(start);
+    }
+    
+    value.trim();
+    if (value.length() > 0) {
+      if (arrayIndex == 0 && dataCount1 < 1000) {
+        stepsData1[dataCount1] = value.toInt();
+        Serial.print("Array1[");
+        Serial.print(dataCount1);
+        Serial.print("]: ");
+        Serial.println(value);
+        dataCount1++;
+      } else if (arrayIndex == 1 && dataCount2 < 1000) {
+        stepsData2[dataCount2] = value.toInt();
+        Serial.print("Array2[");
+        Serial.print(dataCount2);
+        Serial.print("]: ");
+        Serial.println(value);
+        dataCount2++;
+      } else if (arrayIndex == 2 && dataCount1 < 1000) {
+        stepsData3[dataCount1] = value.toInt();
+        Serial.print("Array3[");
+        Serial.print(dataCount1);
+        Serial.print("]: ");
+        Serial.println(value);
+        dataCount3++;
+      }
+      arrayIndex = (arrayIndex + 1) % 3; // Cycle through 0, 1, 2
+    }
+    
+    if (comma == -1) break; // No more commas, we're done
+    start = comma + 1;
+  }
+}
+// void parseArray(String data, int* array) {
+//   dataCount = 0;
+//   int start = 0;
+//   int comma = 0;
+  
+//   while (comma != -1 && dataCount < 1000) {
+//     comma = data.indexOf(',', start);
+    
+//     String value;
+//     if (comma != -1) {
+//       value = data.substring(start, comma);
+//     } else {
+//       value = data.substring(start);
+//     }
+    
+//     value.trim();
+//     if (value.length() > 0) {
+//       array[dataCount] = value.toInt();
+//       dataCount++;
+//     }
+//     Serial.println(value);
+//     start = comma + 1;
+//   }
+// }
+void recordThirdMotorSteps() {
+  if (stepsData3Index >= 1000) return;
+  
+  unsigned long currentTime = millis();
+  if (currentTime - lastStepRecord >= STEP_RECORD_INTERVAL) {
+    // Record absolute position
+    stepsData3[stepsData3Index] = stepper3.currentPosition();
+    stepsData3Index++;
+    lastStepRecord = currentTime;
+  }
+}
+
+// Add new function to send steps data to ESP32
+void sendThirdMotorSteps() {
+  if (stepsData3Index == 0) return;
+  
+  Serial.println("Sending third motor steps data...");
+  
+  // Send header
+  Serial2.println("THIRD_MOTOR_STEPS_START");
+  
+  // Send data count first
+  Serial2.println(stepsData3Index);
+  
+  // Send the steps array
+  for (int i = 0; i < stepsData3Index; i++) {
+    Serial2.println(stepsData3[i]);
+    delay(2); // Small delay to prevent overwhelming ESP32
+  }
+  
+  // Send end marker
+  Serial2.println("THIRD_MOTOR_STEPS_END");
+  
+  Serial.print("Sent ");
+  Serial.print(stepsData3Index);
+  Serial.println(" third motor step records to ESP32");
+}
+// Third motor control functions
+void startThirdMotor() {
+  if (!thirdMotorActive) {
+    thirdMotorActive = true;
+    digitalWrite(BRAKE_PIN, LOW);  // Release brake
+    digitalWrite(ENABLE3_PIN, LOW); // Enable motor (assuming LOW = enabled)
+    Serial.println("Third motor activated - brake released");
+  }
+}
+
+void stopThirdMotor() {
+  if (thirdMotorActive) {
+    thirdMotorActive = false;
+    stepper3.stop();
+      // Engage brake
+    digitalWrite(ENABLE3_PIN, HIGH);
+    digitalWrite(BRAKE_PIN, HIGH); // Disable motor
+    Serial.println("Third motor stopped - brake engaged");
+  }
+}
+
+void updateThirdMotorSpeed(float forceValue) {
+  if (!thirdMotorActive) return;
+  
+  currentForceValue = forceValue;
+  int speed = mapForceToSpeed(abs(forceValue));
+  
+  // Set direction based on force sign
+  if (forceValue > 0) {
+    stepper3.setSpeed(speed);
+  } else {
+    stepper3.setSpeed(-speed);
+  }
+  
+  currentSpeed = speed;
+}
+
+void updateThirdMotor() {
+  if (thirdMotorActive) {
+    stepper3.runSpeed();
+  }
+  recordThirdMotorSteps();
+}
+
+int mapForceToSpeed(float forceValue) {
+  // Clamp force value to our defined range
+  if (forceValue < MIN_FORCE) forceValue = MIN_FORCE;
+  if (forceValue > MAX_FORCE) forceValue = MAX_FORCE;
+  
+  // Map force range to speed range
+  int speed = map(forceValue * 100, MIN_FORCE * 100, MAX_FORCE * 100, MIN_SPEED, MAX_SPEED);
+  
+  Serial.print("Force: ");
+  Serial.print(forceValue);
+  Serial.print(" -> Speed: ");
+  Serial.println(speed);
+  
+  return speed;
+}
+
+void parseHomingCommand(String command) {
+  // Format: "HOMING steps1 steps2"
+  Serial.println(command);
+  int firstSpace = command.indexOf(' ', 7); // Skip "HOMING "
+  int secondSpace = command.indexOf(' ', firstSpace + 1);
+  int thirdspace=command.indexOf(' ', secondSpace + 1);
+  
+  if (firstSpace != -1 && secondSpace != -1) {
+    homingSteps1 = command.substring(7, firstSpace).toInt();
+    homingSteps2 = command.substring(firstSpace + 1, secondSpace).toInt();
+    homingSteps3 = command.substring(secondSpace+1,thirdspace).toInt();
+  } else if (firstSpace != -1) {
+    homingSteps1 = command.substring(7, firstSpace).toInt();
+    homingSteps2 = command.substring(firstSpace + 1,secondSpace).toInt();
+    homingSteps3 = command.substring(secondSpace+1,thirdspace).toInt();
+  }
+  
+  Serial.print("Homing command received - M1: ");
+  Serial.print(homingSteps1);
+  Serial.print(" steps, M2: ");
+  Serial.print(homingSteps2);
+  Serial.print(" steps");
+  Serial.print(homingSteps3);
+  Serial.println();
+  
+  startHoming();
+}
+
+void startHoming() {
+  if (homingActive) {
+    Serial.println("Already homing");
+    return;
+  }
+  
+  Serial.println("Starting homing movement...");
+  digitalWrite(BRAKE_PIN, LOW);  // Release brake
+  digitalWrite(ENABLE3_PIN, LOW);
+  // Set homing speed parameters
+  setHomingSpeed();
+  
+  // Calculate target positions for homing
+  int targetPos1 = stepper1.currentPosition() + homingSteps1;
+  int targetPos2 = stepper2.currentPosition() + homingSteps2;
+  int targetPos3 = stepper3.currentPosition() + homingSteps3;
+  Serial.print("fdgd");
+  Serial.println(homingSteps3);
+  // Set target positions
+  stepper1.moveTo(targetPos1);
+  stepper2.moveTo(targetPos2);
+  Serial.println(stepper3.currentPosition());
+    stepper3.moveTo(targetPos3);
+    Serial.println("homing too");
+  
+  
+  homingActive = true;
+  
+  Serial.print("Moving to homing positions - M1: ");
+  Serial.print(targetPos1);
+  Serial.print(", M2: ");
+  Serial.println(targetPos2);
+}
+
+void updateHoming() {
+  if (!homingActive) return;
+  
+  digitalWrite(BRAKE_PIN, LOW);  // Release brake
+  digitalWrite(ENABLE3_PIN, LOW);
+  // Run both steppers
+  stepper1.run();
+  stepper2.run();
+  stepper3.run();
+  Serial.println(stepper3.currentPosition());
+  // Check if both steppers have reached their targets
+  if (stepper1.distanceToGo() == 0 && stepper2.distanceToGo() == 0 && stepper3.distanceToGo() == 0) {
+    Serial.println("Homing movement completed");
+    Serial.println(stepper3.currentPosition());
+    homingActive = false;
+    
+    // Send completion signal to ESP32
+    Serial2.println("HOMING_COMPLETE");
+    digitalWrite(ENABLE3_PIN, HIGH);
+    digitalWrite(BRAKE_PIN,HIGH);
+  }
+}
+
+void stopHoming() {
+  if (homingActive) {
+    homingActive = false;
+    digitalWrite(ENABLE3_PIN, HIGH);
+    digitalWrite(BRAKE_PIN, HIGH); 
+    stepper1.stop();
+    stepper2.stop();
+    stepper3.stop();
+    Serial.println("Homing stopped");
+  }
+}
+
+void setHomingSpeed() {
+  stepper1.setMaxSpeed(HOMING_MAX_SPEED);
+  stepper1.setAcceleration(HOMING_ACCELERATION);
+  stepper2.setMaxSpeed(HOMING_MAX_SPEED);
+  stepper2.setAcceleration(HOMING_ACCELERATION);
+  stepper3.setMaxSpeed(HOMING_MAX_SPEED);
+  stepper3.setAcceleration(HOMING_ACCELERATION);
+  
+  Serial.println("Speed set to homing parameters");
+}
+
+void setNormalSpeed() {
+  stepper1.setMaxSpeed(NORMAL_MAX_SPEED);
+  stepper1.setAcceleration(NORMAL_ACCELERATION);
+  stepper2.setMaxSpeed(NORMAL_MAX_SPEED);
+  stepper2.setAcceleration(NORMAL_ACCELERATION);
+  stepper3.setMaxSpeed(NORMAL_MAX_SPEED);
+  stepper3.setAcceleration(NORMAL_ACCELERATION);
+  
+  Serial.println("Speed set to normal parameters");
+}
+
+
+
+void startMotion() {
+
+  if (dataCount1 > 0) {
+    Serial.println("Starting motion sequence...");
+    
+    // Set initial positions (first data point)
+    stepper1.setCurrentPosition(stepsData1[0]);
+    stepper2.setCurrentPosition(stepsData2[0]);
+    stepper3.setCurrentPosition(stepsData3[0]);
+    
+    // Start from second point if available
+    currentPointIndex = 1;
+    motionActive = true;
+    lastMoveTime = millis();
+    
+    digitalWrite(ENABLE2_PIN, LOW);
+    digitalWrite(ENABLE1_PIN, LOW);
+   
+
+    if (dataCount1 > 1) {
+      // Move to second point
+      if(stepsData3[1]==0)
+      {
+        digitalWrite(BRAKE_PIN, HIGH);
+        digitalWrite(ENABLE3_PIN,HIGH);
+      }
+      stepper1.moveTo(stepsData1[1]);
+      stepper2.moveTo(stepsData2[1]);
+      stepper3.moveTo(stepsData3[1]);
+      Serial.print(stepper1.currentPosition());
+      Serial.print("  ");
+      Serial.print(stepper2.currentPosition());
+      Serial.print("  ");
+      Serial.println(stepper3.currentPosition());
+      Serial.print("Moving to point ");
+      Serial.print(currentPointIndex + 1);
+      Serial.print(": Motor1=");
+      Serial.print(stepsData1[1]);
+      Serial.print(", Motor2=");
+      Serial.println(stepsData2[1]);
+    } else {
+      Serial.println("Only one data point - motion complete");
+      digitalWrite(BRAKE_PIN, HIGH);
+      digitalWrite(ENABLE3_PIN,HIGH);
+      motionActive = false;
+    }
+  }
+  else{
+    Serial.println("fhbsbf");
+  }
+}
+
+void updateMotion() {
+  if (!motionActive) return;
+ 
+  // Always run the steppers for smooth motion
+  stepper1.run();
+  stepper2.run();
+  stepper3.run();
+  
+  // Check if it's time to move to next point
+  if (millis() - lastMoveTime >= MOVE_INTERVAL) {
+    currentPointIndex++;
+    
+    if (currentPointIndex < dataCount1) {
+      // Move to next point
+      stepper1.moveTo(stepsData1[currentPointIndex]);
+      stepper2.moveTo(stepsData2[currentPointIndex]);
+      if(stepsData3[currentPointIndex-1]>stepsData3[currentPointIndex]||stepsData3[currentPointIndex-1]<stepsData3[currentPointIndex])
+      {
+        digitalWrite(ENABLE3_PIN,LOW);
+        digitalWrite(BRAKE_PIN, LOW);
+        stepper3.moveTo(stepsData3[currentPointIndex]);
+      }
+      else
+      {
+        digitalWrite(BRAKE_PIN, HIGH);
+        digitalWrite(ENABLE3_PIN,HIGH);
+      }
+      
+      Serial.print("Moving to point ");
+      Serial.print(currentPointIndex + 1);
+      Serial.print(": Motor1=");
+      Serial.print(stepsData1[currentPointIndex]);
+      Serial.print(", Motor2=");
+      Serial.print(stepsData2[currentPointIndex]);
+      Serial.print(", Motor3=");
+      Serial.println(stepsData3[currentPointIndex+1]);
+      
+      lastMoveTime = millis();
+    } else {
+      // Motion sequence complete
+      digitalWrite(BRAKE_PIN, HIGH);
+      digitalWrite(ENABLE3_PIN,HIGH);
+      
+      Serial.println("Motion sequence completed!");
+      motionActive = false;
+    }
+  }
+}
+
+void stopMotion() {
+  motionActive = false;
+  stepper1.stop();
+  stepper2.stop();
+  stepper3.stop();
+  Serial.println("Motion stopped");
+}
